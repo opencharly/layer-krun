@@ -1,0 +1,306 @@
+# The krun runtime host: crun built from the pinned upstream commit that carries BOTH the
+# passt fix and the /proc remount, libkrun 1.x, the libkrunfw-crabbox guest kernel, and the
+# host-side pieces crun hardcodes. CONTAINERD-IMAGES.md §1.3 (`krun-host`), LIBKRUN.md §10,
+# CONTAINERD.md §5.2 and §14.3.
+layer-krun:
+    candy:
+        description: |
+            The krun runtime host. crun is built from the pinned upstream commit
+            ca04fdb6c26f0c8259871f2cccd0e6e652ec03ce — "krun: Remount /proc before starting
+            passt, if the PID namespace was detached" — because no release carries both that
+            remount and the passt start path: crun 1.30.1 cannot start passt at all (`start
+            passt`, rc 1), so in-guest CRIU is main-only until a release ships both
+            (LIBKRUN.md §10). It is configured `--with-libkrun`, and `/usr/bin/krun` is the
+            same binary by another name, the spelling the containerd handler names. libkrun is
+            the 1.x line (the distro's 1.19.x; never `main`, whose 2.0 rewrite drops
+            `krun_set_vm_config`, `krun_set_gpu_options` and `krun_start_enter` that crun
+            resolves), with libkrunfw 5.6.2 and passt. crun hardcodes `/usr/bin/bwrap` and
+            `/usr/libexec/virgl_render_server`; the distro provides the first and installs the
+            second at `/usr/lib/`, so this layer provides the path. The host Vulkan ICDs the
+            render server loads are installed separately (`vulkan-virtio` and `vulkan-swrast`;
+            `mesa` no longer ships them), and an NVIDIA host's ICD is asserted at runtime
+            rather than installed by this layer. `/dev/kvm` is asserted on the venue, and
+            `kvm_intel`/`kvm_amd` `nested=1` is available as an option
+            (`CHARLY_KRUN_NESTED=1`). Finally the `libkrunfw-crabbox` guest kernel: built from
+            libkrunfw v5.6.2's own sources, patches and stock config PLUS a committed fragment
+            (CHECKPOINT_RESTORE, the socket diag options, the netfilter/nft/x_tables/IP-set/
+            IPVS/VXLAN set k3s needs, `BASE_SMALL=n`), `make vmlinux` only, shipped at
+            `/krun/vmlinux` for `krun.custom_kernel` (`kernel_format: 1`).
+        distro:
+            arch:
+                package:
+                    # The toolchain crun and the guest kernel are built with. The final image
+                    # keeps it on purpose: crun is built from a commit, not installed from a
+                    # package, so the same image can rebuild the pin without a new base.
+                    - base-devel
+                    - git
+                    - curl
+                    - tar
+                    - xz
+                    - bc
+                    - perl
+                    - openssl
+                    - libelf
+                    - cpio
+                    - kmod
+                    - diffutils
+                    - rsync
+                    - python
+                    - go-md2man
+                    - libcap
+                    - libseccomp
+                    - json-c
+                    - systemd-libs
+                    # The runtime pieces.
+                    - passt
+                    - criu
+                    - bubblewrap
+                    - virglrenderer
+                    - vulkan-icd-loader
+                    - vulkan-virtio
+                    - vulkan-swrast
+                    - libkrun
+                    - libkrunfw
+        plan:
+            - run: create the directory the render-server path lives in
+              mkdir: /usr/libexec
+              mode: "0755"
+              run_as: root
+            - run: stage the committed libkrunfw-crabbox kernel config fragment
+              id: krun-config-fragment
+              copy: config-libkrunfw-crabbox.fragment
+              to: /tmp/krun/config-libkrunfw-crabbox.fragment
+              mode: "0644"
+              run_as: root
+            - run: build crun from the pinned upstream commit that carries passt and the /proc remount
+              id: krun-crun
+              run_as: root
+              cache:
+                  - /var/cache/charly/krun-build
+              command: |
+                  set -eu
+                  # No release carries both fixes (LIBKRUN.md §10). The /proc remount is
+                  # src/libcrun/handlers/krun.c:824-838 inside this commit.
+                  commit=ca04fdb6c26f0c8259871f2cccd0e6e652ec03ce
+                  src=/var/cache/charly/krun-build/crun
+                  if [ ! -d "$src/.git" ]; then
+                    git clone https://github.com/containers/crun "$src"
+                  fi
+                  git -C "$src" fetch origin
+                  git -C "$src" checkout --detach "$commit"
+                  cd "$src"
+                  ./autogen.sh
+                  ./configure --prefix=/usr --with-libkrun
+                  make -j"$(nproc)"
+                  make install
+                  # The contract is the FEATURE, not the install: a crun that silently lost
+                  # libkrun or CRIU while configuring would install and then fail at run time.
+                  crun --version | grep -q '+LIBKRUN' || {
+                    echo "crun was built without libkrun support" >&2; exit 1; }
+                  crun --version | grep -q '+CRIU' || {
+                    echo "crun was built without CRIU support (install criu before configuring)" >&2; exit 1; }
+                  echo "crun $(crun --version | sed -n 's/^crun version //p') with +LIBKRUN +CRIU"
+            - run: install the krun entry point crun's handler resolves
+              id: krun-binary
+              link: /usr/bin/krun
+              target: /usr/bin/crun
+              run_as: root
+            - run: provide virgl_render_server at the path crun hardcodes
+              id: krun-render-server
+              run_as: root
+              command: |
+                  set -eu
+                  # crun hardcodes /usr/libexec/virgl_render_server. Arch installs the server
+                  # at /usr/lib/virgl_render_server (MEASURED on the host: /usr/lib exists,
+                  # /usr/libexec does not), so provide the path crun opens.
+                  dst=/usr/libexec/virgl_render_server
+                  if [ -x "$dst" ]; then
+                    echo "$dst is already present"
+                    exit 0
+                  fi
+                  for src in /usr/lib/virgl_render_server /usr/lib64/virgl_render_server /usr/bin/virgl_render_server; do
+                    if [ -x "$src" ]; then
+                      ln -sf "$src" "$dst"
+                      echo "$dst -> $src"
+                      exit 0
+                    fi
+                  done
+                  echo "no virgl_render_server found; crun hardcodes $dst" >&2
+                  exit 1
+            - run: optionally persist and apply kvm_* nested=1 for nested VMs
+              id: krun-nested-virt
+              run_as: root
+              command: |
+                  set -eu
+                  # An OPTION, not a default: nested virt is only wanted where a guest runs a
+                  # VM of its own. Set CHARLY_KRUN_NESTED=1 to persist and apply it.
+                  if [ "${CHARLY_KRUN_NESTED:-0}" != 1 ]; then
+                    echo "kvm nested virt not requested (set CHARLY_KRUN_NESTED=1 to enable)"
+                    exit 0
+                  fi
+                  mkdir -p /etc/modprobe.d
+                  printf '%s\n' 'options kvm_intel nested=1' 'options kvm_amd nested=1' > /etc/modprobe.d/charly-krun-nested.conf
+                  for m in kvm_intel kvm_amd; do
+                    p=/sys/module/$m/parameters/nested
+                    if [ -e "$p" ]; then
+                      if [ -w "$p" ]; then
+                        printf '1\n' > "$p"
+                        echo "$m: nested=1 applied"
+                      else
+                        echo "$m: $p is not writable here; the drop-in applies on the next boot"
+                      fi
+                    fi
+                  done
+            - run: build the libkrunfw-crabbox guest kernel (make vmlinux only)
+              id: krun-guest-kernel
+              run_as: root
+              cache:
+                  - /var/cache/charly/krun-kernel
+              command: |
+                  set -eu
+                  cache=/var/cache/charly/krun-kernel
+                  kfw=$cache/libkrunfw
+                  fragment=/tmp/krun/config-libkrunfw-crabbox.fragment
+                  if [ ! -d "$kfw/.git" ]; then
+                    git clone --depth 1 --branch v5.6.2 https://github.com/containers/libkrunfw "$kfw"
+                  fi
+                  cd "$kfw"
+                  # libkrunfw's OWN Makefile downloads linux-6.12.109, applies ITS patches and
+                  # copies ITS stock config, then runs olddefconfig. That is the "sources +
+                  # patches + config" the contract names; this layer only ADDS a fragment.
+                  make linux-6.12.109
+                  if ! grep -q 'CHARLY_LIBKRUNFW_CRABBOX' linux-6.12.109/.config; then
+                    printf '\n# CHARLY_LIBKRUNFW_CRABBOX\n' >> linux-6.12.109/.config
+                    cat "$fragment" >> linux-6.12.109/.config
+                  fi
+                  make -C linux-6.12.109 olddefconfig
+                  # The fragment is only real if olddefconfig KEPT it. Assert every option and
+                  # fail the build when a dependency is missing, rather than ship a silently
+                  # reduced kernel whose gaps surface later as "Diag module missing (-2)".
+                  missing=""
+                  for opt in CHECKPOINT_RESTORE INET_DIAG UNIX_DIAG NETLINK_DIAG PACKET_DIAG \
+                             NETFILTER NETFILTER_ADVANCED NF_CONNTRACK NF_NAT NF_TABLES \
+                             NETFILTER_XTABLES NFT_COMPAT NFT_NUMGEN \
+                             IP_NF_IPTABLES IP_NF_FILTER IP_NF_MANGLE IP_NF_NAT \
+                             IP_NF_TARGET_MASQUERADE IP_NF_TARGET_REJECT \
+                             NETFILTER_XT_MATCH_MULTIPORT NETFILTER_XT_MATCH_COMMENT \
+                             NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_ADDRTYPE \
+                             NETFILTER_XT_MATCH_MARK NETFILTER_XT_MATCH_TCPMSS \
+                             NETFILTER_XT_TARGET_MASQUERADE NETFILTER_XT_TARGET_MARK \
+                             IP_SET IP_VS IP_VS_PROTO_TCP IP_VS_PROTO_UDP IP_VS_NFCT IP_VS_RR \
+                             VXLAN IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES; do
+                    grep -qx "CONFIG_$opt=y" linux-6.12.109/.config || missing="$missing CONFIG_$opt"
+                  done
+                  if grep -qx 'CONFIG_BASE_SMALL=y' linux-6.12.109/.config; then
+                    missing="$missing CONFIG_BASE_SMALL=n"
+                  fi
+                  if [ -n "$missing" ]; then
+                    echo "the merged kernel config did not keep:$missing" >&2
+                    echo "a required option was dropped by olddefconfig - its dependency is missing" >&2
+                    exit 1
+                  fi
+                  make -C linux-6.12.109 -j"$(nproc)" vmlinux
+                  install -d -m 0755 /krun
+                  install -m 0644 linux-6.12.109/vmlinux /krun/vmlinux
+                  echo "/krun/vmlinux: $(stat -c %s /krun/vmlinux) bytes"
+            # ===== the layer's own checks =====
+            # Build-context checks assert the artifacts. The two live-only properties
+            # (/dev/kvm and an NVIDIA host's Vulkan ICD) are `context: [runtime]`, so
+            # `charly check box` skips them by design and `charly check live` asserts them on
+            # the venue.
+            - check: crun is built from the pinned commit with libkrun and CRIU support
+              id: krun-crun-features
+              exit_status: 0
+              stdout:
+                  - contains: ['+LIBKRUN', '+CRIU']
+              command: crun --version
+            - check: the krun entry point crun's handler resolves is installed
+              id: krun-entry-point
+              file:
+                  file: /usr/bin/krun
+                  exists: true
+            - check: libkrun 1.x and libkrunfw are on the dynamic loader path
+              id: krun-libraries
+              exit_status: 0
+              command: |
+                  set -eu
+                  ldconfig -p | grep -q 'libkrun.so.1' || {
+                    echo "libkrun.so.1 is not on the loader path: crun's handler cannot dlopen it" >&2
+                    exit 1; }
+                  ldconfig -p | grep -q 'libkrunfw.so.5' || {
+                    echo "libkrunfw.so.5 is not on the loader path" >&2
+                    exit 1; }
+                  echo "libkrun.so.1 and libkrunfw.so.5 are on the loader path"
+            - check: bubblewrap is at the path crun hardcodes
+              id: krun-bwrap
+              file:
+                  file: /usr/bin/bwrap
+                  exists: true
+            - check: the virgl render server is at the path crun hardcodes
+              id: krun-virgl-render-server
+              file:
+                  file: /usr/libexec/virgl_render_server
+                  exists: true
+            - check: the host Vulkan ICDs the render server loads are installed
+              id: krun-vulkan-icds
+              exit_status: 0
+              command: |
+                  set -eu
+                  # `mesa` no longer ships the Vulkan ICDs; without these the render server
+                  # fails "Found no drivers" (CONTAINERD.md §14.3).
+                  for icd in lvp_icd.json virtio_icd.json; do
+                    f="/usr/share/vulkan/icd.d/$icd"
+                    if [ ! -f "$f" ]; then
+                      echo "$f is missing: the render server would fail 'Found no drivers'" >&2
+                      exit 1
+                    fi
+                    echo "$f"
+                  done
+            - check: the libkrunfw-crabbox guest kernel is installed at the fixed custom-kernel path
+              id: krun-guest-kernel-installed
+              exit_status: 0
+              command: |
+                  set -eu
+                  f=/krun/vmlinux
+                  if [ ! -f "$f" ]; then
+                    echo "$f is missing: krun.custom_kernel has nothing to load" >&2
+                    exit 1
+                  fi
+                  sz=$(stat -c %s "$f")
+                  if [ "$sz" -lt 1048576 ]; then
+                    echo "$f is only $sz bytes: not a built kernel image" >&2
+                    exit 1
+                  fi
+                  if ! head -c 4 "$f" | od -An -tx1 | grep -q '7f 45 4c 46'; then
+                    echo "$f is not an ELF image: kernel_format 1 expects a vmlinux" >&2
+                    exit 1
+                  fi
+                  echo "$f: $sz bytes, ELF"
+            - check: /dev/kvm is readable on the host that runs krun
+              id: krun-kvm
+              context: [runtime]
+              exit_status: 0
+              command: |
+                  set -eu
+                  if [ ! -r /dev/kvm ]; then
+                    echo "/dev/kvm is not readable by this user: krun needs it (mode 0666, or membership in group kvm)" >&2
+                    exit 1
+                  fi
+                  echo "/dev/kvm is readable"
+            - check: the NVIDIA Vulkan ICD is present on an NVIDIA host
+              id: krun-nvidia-icd
+              context: [runtime]
+              exit_status: 0
+              command: |
+                  set -eu
+                  # venus runs the HOST's Vulkan loader inside the render server's sandbox, so
+                  # an NVIDIA host needs its ICD. A non-NVIDIA host passes with a VISIBLE N/A.
+                  if ! command -v nvidia-smi >/dev/null 2>&1 && [ ! -e /dev/nvidia0 ]; then
+                    echo "N/A: no NVIDIA host detected (no nvidia-smi, no /dev/nvidia0)"
+                    exit 0
+                  fi
+                  if [ ! -f /usr/share/vulkan/icd.d/nvidia_icd.json ]; then
+                    echo "an NVIDIA host has no /usr/share/vulkan/icd.d/nvidia_icd.json: the venus render server cannot load the NVIDIA driver" >&2
+                    exit 1
+                  fi
+                  echo "/usr/share/vulkan/icd.d/nvidia_icd.json is present"

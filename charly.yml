@@ -165,6 +165,27 @@ layer-krun:
                     git clone --depth 1 --branch v5.6.2 https://github.com/containers/libkrunfw "$kfw"
                   fi
                   cd "$kfw"
+                  # The box bootstrap exports ARCH=amd64 (the OCI TARGETARCH). libkrunfw's
+                  # Makefile treats a NON-EMPTY ARCH as the KERNEL's arch spelling and derives
+                  # GUESTARCH=$(ARCH), so it copies config-libkrunfw_amd64 — which does not
+                  # exist (the file is config-libkrunfw_x86_64) — and the kernel's own build
+                  # system would look for arch/amd64. Use the kernel spelling for this step
+                  # (libkrunfw itself maps arm64->aarch64 and riscv->riscv64).
+                  case "$(uname -m)" in
+                    x86_64) karch=x86_64 ;;
+                    aarch64|arm64) karch=arm64 ;;
+                    riscv64) karch=riscv ;;
+                    *) karch="$(uname -m)" ;;
+                  esac
+                  export ARCH="$karch"
+                  # A killed or failed build can leave the extracted tree without the stock
+                  # .config (the Makefile's cp is the last step of the extract recipe). The
+                  # directory target would then read as "up to date", skip the config copy,
+                  # and the fragment below would be appended to an empty .config. Force a
+                  # clean extract/patched tree in that state.
+                  if [ ! -s linux-6.12.109/.config ]; then
+                    rm -rf linux-6.12.109
+                  fi
                   # libkrunfw's OWN Makefile downloads linux-6.12.109, applies ITS patches and
                   # copies ITS stock config, then runs olddefconfig. That is the "sources +
                   # patches + config" the contract names; this layer only ADDS a fragment.

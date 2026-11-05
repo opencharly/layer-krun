@@ -33,6 +33,8 @@ The krun runtime host layer. The authoritative rulebook is the umbrella `AGENTS.
 - Build it from **libkrunfw v5.6.2's own sources, patches and stock config** (its Makefile
   does the download/patch/`olddefconfig`), plus the committed fragment, and `make vmlinux`
   only.
+- **The recipe is `files/build-kernel.sh`, the ONE copy.** The candy installs it and runs
+  it; downstream image repos fetch it from a pinned layer tag rather than copying the steps.
 - The build asserts every fragment option survived `olddefconfig`; if you add an option, add
   it to both the fragment and the assertion loop. A silently dropped option is the defect the
   assertion exists to catch.

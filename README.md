@@ -93,6 +93,8 @@ kernel is selected with `krun.custom_kernel` plus `kernel_path=/krun/vmlinux`,
 
 ## Layout
 
+- `files/build-kernel.sh` — the canonical `libkrunfw-crabbox` guest-kernel recipe (the
+  candy installs and runs it; downstream repos fetch it at a pinned tag).
 - `charly.yml` — the `layer-krun` candy: the package arms, the crun build, the host paths, the
   optional nested-virt step, the guest-kernel build, and the checks.
 - `config-libkrunfw-crabbox.fragment` — the committed kernel config fragment.
